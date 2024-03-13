@@ -11,7 +11,8 @@ import boto3
 import botocore
 import collections
 import sqlalchemy
-
+import tqdm
+import os
 
 class CellLocation:
     """This class holds all the functions augment a metadata file with X,Y
@@ -97,9 +98,10 @@ class CellLocation:
         self.cell_y_loc = cell_y_loc
         # Currently constrained to only anonymous access for S3 resources
         # https://github.com/cytomining/pycytominer/issues/268
-        self.s3 = boto3.client(
-            "s3", config=botocore.config.Config(signature_version=botocore.UNSIGNED)
-        )
+        # self.s3 = boto3.client(
+        #     "s3", config=botocore.config.Config(signature_version=botocore.UNSIGNED)
+        # )
+        self.update_aws_credentials()
 
     def _expanduser(self, obj: Union[str, None]):
         """Expand the user home directory in a path"""
@@ -167,8 +169,10 @@ class CellLocation:
         tmp_file = tempfile.NamedTemporaryFile(
             delete=False, suffix=pathlib.Path(key).name
         )
-
-        self.s3.download_file(bucket, key, tmp_file.name)
+        print(f"Downloadng file from s3 at {tmp_file.name}")
+        object_size = self.s3.head_object(Bucket=bucket, Key=key)["ContentLength"]
+        with tqdm.tqdm(total=object_size, unit="B", unit_scale=True, desc=tmp_file.name) as pbar:
+            self.s3.download_file(bucket, key, tmp_file.name, Callback=lambda bytes_transferred: pbar.update(bytes_transferred))
 
         return tmp_file.name
 
@@ -366,12 +370,16 @@ class CellLocation:
 
         for image_key in self.image_key:
             column_types[image_key] = "str"
+	
+        print("DEBUG - before sql query")
 
         joined_df = pd.read_sql_query(join_query, engine, dtype=column_types)
 
         # if the single_cell file was downloaded from S3, delete the temporary file
         if temp_single_cell_input is not None:
             pathlib.Path(temp_single_cell_input).unlink()
+	
+        print("DEBUG - after sql query")
 
         return joined_df
 
@@ -383,6 +391,7 @@ class CellLocation:
         Pandas DataFrame
             The required columns from the `Image` and `Nuclei` tables loaded into a Pandas DataFrame
         """
+        print("DEBUG - load single cell")
 
         return self._create_nested_df(self._get_joined_image_nuclei_tables())
 
@@ -395,6 +404,8 @@ class CellLocation:
         Pandas DataFrame
             Either a data frame or the path to a Parquet file with the X,Y locations of all cells packed into a single column
         """
+
+        self.update_aws_credentials()
 
         # If self.augmented_metadata_output is not None and it is a str and the file already exists, there is nothing to do
         if (
@@ -416,7 +427,10 @@ class CellLocation:
             # TODO: Consider doing a quick difference check should the file already exist.
             # For example, if the file already exists and it's different than what could be possibly incoming, should the user know?
             # This will involve performing all the steps below and then doing a check to see if the file is different, so this is a bit of a pain.
+            print(f"File {self.augmented_metadata_output} already exists. Skipping.")
             return self.augmented_metadata_output
+
+        print(f"File {self.augmented_metadata_output} does not exist. Proceeding with augmentation.")
 
         # Load the data
         metadata_df = self._load_metadata()
@@ -433,9 +447,47 @@ class CellLocation:
         # If self.augmented_metadata_output is not None, save the data
         if self.augmented_metadata_output is not None:
             # TODO: switch to https://github.com/cytomining/pycytominer/blob/main/pycytominer/cyto_utils/output.py if we want to support more file types
+            self.update_aws_credentials()
             augmented_metadata_df.to_parquet(
                 self.augmented_metadata_output, index=False
             )
             return self.augmented_metadata_output
         else:
             return augmented_metadata_df
+
+    def update_aws_credentials(self):
+        client = boto3.client('s3control', region_name='us-east-1')
+
+        try:
+            # Run the get_data_access method
+            response = client.get_data_access(
+                AccountId='309624411020',
+                Target='s3://staging-cellpainting-gallery/*',
+                Permission='READWRITE',
+                Privilege='Default',
+                DurationSeconds=43200,
+            )
+
+            # Extract credentials
+            credentials = response['Credentials']
+            AccessKeyId = credentials['AccessKeyId']
+            SecretAccessKey = credentials['SecretAccessKey']
+            SessionToken = credentials['SessionToken']
+
+            # Export the credentials as environment variables for the current process
+            os.environ['AWS_ACCESS_KEY_ID'] = AccessKeyId
+            os.environ['AWS_SECRET_ACCESS_KEY'] = SecretAccessKey
+            os.environ['AWS_SESSION_TOKEN'] = SessionToken
+
+            self.s3 = boto3.client(
+                "s3",
+                aws_access_key_id=AccessKeyId,
+                aws_secret_access_key=SecretAccessKey,
+                aws_session_token=SessionToken
+            )
+
+            print("AWS credentials have been set successfully.")
+        except Exception as e:
+            print(f"Failed to get data access information: {e}")
+            exit(1)
+
